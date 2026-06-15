@@ -1,37 +1,35 @@
 // Package urbandictionary is the library behind the urbandictionary command line:
-// the HTTP client, request shaping, and the typed data models for urbandictionary.
+// the HTTP client, request shaping, and the typed data models for the
+// Urban Dictionary public API (api.urbandictionary.com).
 //
 // The Client here is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
-// transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
+// transient failures (429 and 5xx) that any public API throws under load.
 package urbandictionary
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"regexp"
-	"strings"
+	"net/url"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to urbandictionary. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
-const DefaultUserAgent = "urbandictionary/dev (+https://github.com/tamnd/urbandictionary-cli)"
-
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at urbandictionary.com; change it once you
-// know the real endpoints you want to read.
-const Host = "urbandictionary.com"
+// Host is the API host for Urban Dictionary.
+const Host = "api.urbandictionary.com"
 
 // BaseURL is the root every request is built from.
-const BaseURL = "https://" + Host
+const BaseURL = "https://api.urbandictionary.com/v0"
 
-// Client talks to urbandictionary over HTTP.
+// DefaultUserAgent identifies the client to Urban Dictionary.
+const DefaultUserAgent = "urbandictionary-cli/0.1 (tamnd87@gmail.com)"
+
+// Client talks to the Urban Dictionary API over HTTP.
 type Client struct {
 	HTTP      *http.Client
+	BaseURL   string
 	UserAgent string
 	// Rate is the minimum gap between requests. Zero means no pacing.
 	Rate    time.Duration
@@ -40,20 +38,123 @@ type Client struct {
 	last time.Time
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
+// NewClient returns a Client with sensible defaults.
 func NewClient() *Client {
 	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+		HTTP:      &http.Client{Timeout: 15 * time.Second},
+		BaseURL:   BaseURL,
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Rate:      500 * time.Millisecond,
+		Retries:   3,
 	}
 }
 
+// Definition is a single Urban Dictionary entry.
+type Definition struct {
+	DefID      int    `json:"def_id"`
+	Word       string `json:"word"`
+	Definition string `json:"definition"`
+	Example    string `json:"example"`
+	Author     string `json:"author"`
+	ThumbsUp   int    `json:"thumbs_up"`
+	ThumbsDown int    `json:"thumbs_down"`
+	WrittenOn  string `json:"written_on"`
+	Permalink  string `json:"permalink"`
+}
+
+// Suggestion is a single autocomplete result.
+type Suggestion struct {
+	Term string `json:"term"`
+}
+
+// wire types -----------------------------------------------------------------
+
+type wireDefineResp struct {
+	List []wireDefinition `json:"list"`
+	Tags []string         `json:"tags"`
+}
+
+type wireDefinition struct {
+	DefID      int    `json:"defid"`
+	Word       string `json:"word"`
+	Definition string `json:"definition"`
+	Example    string `json:"example"`
+	Author     string `json:"author"`
+	ThumbsUp   int    `json:"thumbs_up"`
+	ThumbsDown int    `json:"thumbs_down"`
+	WrittenOn  string `json:"written_on"`
+	Permalink  string `json:"permalink"`
+}
+
+func wireToDefinition(w wireDefinition) *Definition {
+	return &Definition{
+		DefID:      w.DefID,
+		Word:       w.Word,
+		Definition: w.Definition,
+		Example:    w.Example,
+		Author:     w.Author,
+		ThumbsUp:   w.ThumbsUp,
+		ThumbsDown: w.ThumbsDown,
+		WrittenOn:  w.WrittenOn,
+		Permalink:  w.Permalink,
+	}
+}
+
+// DefineWord looks up a slang term and returns its definitions.
+func (c *Client) DefineWord(ctx context.Context, term string) ([]*Definition, error) {
+	u := c.BaseURL + "/define?term=" + url.QueryEscape(term)
+	body, err := c.Get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var resp wireDefineResp
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("parse define response: %w", err)
+	}
+	out := make([]*Definition, 0, len(resp.List))
+	for _, w := range resp.List {
+		out = append(out, wireToDefinition(w))
+	}
+	return out, nil
+}
+
+// RandomDefinitions returns random Urban Dictionary definitions.
+func (c *Client) RandomDefinitions(ctx context.Context) ([]*Definition, error) {
+	body, err := c.Get(ctx, c.BaseURL+"/random")
+	if err != nil {
+		return nil, err
+	}
+	var resp wireDefineResp
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return nil, fmt.Errorf("parse random response: %w", err)
+	}
+	out := make([]*Definition, 0, len(resp.List))
+	for _, w := range resp.List {
+		out = append(out, wireToDefinition(w))
+	}
+	return out, nil
+}
+
+// Autocomplete returns term suggestions for the given prefix.
+func (c *Client) Autocomplete(ctx context.Context, prefix string) ([]*Suggestion, error) {
+	u := c.BaseURL + "/autocomplete?term=" + url.QueryEscape(prefix)
+	body, err := c.Get(ctx, u)
+	if err != nil {
+		return nil, err
+	}
+	var terms []string
+	if err := json.Unmarshal(body, &terms); err != nil {
+		return nil, fmt.Errorf("parse autocomplete response: %w", err)
+	}
+	out := make([]*Suggestion, 0, len(terms))
+	for _, t := range terms {
+		out = append(out, &Suggestion{Term: t})
+	}
+	return out, nil
+}
+
 // Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
+// to the client's settings.
 func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 	var lastErr error
 	for attempt := 0; attempt <= c.Retries; attempt++ {
@@ -76,9 +177,9 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 	return nil, fmt.Errorf("get %s: %w", url, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) (body []byte, retry bool, err error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
@@ -121,80 +222,4 @@ func backoff(attempt int) time.Duration {
 		d = 5 * time.Second
 	}
 	return d
-}
-
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on urbandictionary.com. It is a stand-in for the typed records you
-// will model from the real urbandictionary endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `urbandictionary cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }
